@@ -11,8 +11,7 @@ export default async function handler(request, response) {
   }
 
   try {
-    // 2) Запрашиваем страницу пользователя TikTok
-    //    Добавляем lang=en для консистентности
+    // 2) Запрашиваем страницу пользователя TikTok с заголовками, как от браузера
     const tiktokUrl = `https://www.tiktok.com/@${username}?lang=en`;
     const resp = await fetch(tiktokUrl, {
       headers: {
@@ -28,34 +27,33 @@ export default async function handler(request, response) {
     });
 
     if (!resp.ok) {
+      // Если TikTok вернул ошибку (404, 503 и т.д.), сразу отдадим её клиенту
       response.status(resp.status).json({ error: 'failed to fetch TikTok page' });
       return;
     }
 
-    // 3) Читаем весь HTML
+    // 3) Читаем весь HTML страницы
     const html = await resp.text();
 
-    // 4) Пытаемся извлечь JSON из <script id="SIGI_STATE">…</script>
+    // Попытаемся последовательно найти followerCount тремя способами:
+    let count = null;
+    let debug = {
+      sigi: 'not attempted',
+      next: 'not attempted',
+      regex: 'not attempted'
+    };
+
+    //
+    // 4) СПОСОБ №1: Парсим JSON из <script id="SIGI_STATE">…</script>
+    //
     const sigiRegex = /<script\s+id="SIGI_STATE"\s+type="application\/json">([^<]+)<\/script>/;
     const sigiMatch = html.match(sigiRegex);
-
     if (sigiMatch && sigiMatch[1]) {
-      let sigiJson;
+      debug.sigi = 'found SIGI_STATE tag';
       try {
-        sigiJson = JSON.parse(sigiMatch[1]);
-      } catch (parseErr) {
-        // Если JSON внутри SIGI_STATE испорчен или неожиданного вида
-        // Переходим к резервному способу
-        sigiJson = null;
-      }
-
-      if (sigiJson) {
-        // Новый путь может быть: sigiJson.UserModule.users[username].stats.followerCount
-        // Некоторые версии TikTok кладут данные в sigiJson.ItemModule или sigiJson.UserPage
-        let count = null;
-
-        // Попробуем сразу несколько вариантов поиска:
-        // Вариант A: стандартный путь UserModule.users[username].stats.followerCount
+        const sigiJson = JSON.parse(sigiMatch[1]);
+        // Есть два вероятных пути внутри sigiJson, где лежит followerCount:
+        // A) sigiJson.UserModule.users[username].stats.followerCount
         if (
           sigiJson.UserModule &&
           sigiJson.UserModule.users &&
@@ -65,15 +63,8 @@ export default async function handler(request, response) {
         ) {
           count = sigiJson.UserModule.users[username].stats.followerCount;
         }
-
-        // Вариант B: иногда TikTok кладёт данные в ItemModule (для видео),
-        // но нам нужен именно профиль → обычно не актуально для followerCount.
-        // Поэтому можно не рассматривать ItemModule в данном контексте.
-
-        // Вариант C: в некоторых локализациях путь находится в sigiJson.UserPage,
-        // но чаще всего ProfilePage содержит stats внутри state
-        if (
-          count === null &&
+        // B) sigiJson.UserPage[username].stats.followerCount  (иногда встречается в другом разделе)
+        else if (
           sigiJson.UserPage &&
           sigiJson.UserPage[username] &&
           sigiJson.UserPage[username].stats &&
@@ -83,36 +74,93 @@ export default async function handler(request, response) {
         }
 
         if (count !== null) {
+          // Успешно нашли в SIGI_STATE
           response.status(200).json({ followerCount: count });
           return;
+        } else {
+          debug.sigi = 'SIGI_STATE tag found, but no followerCount at expected paths';
         }
+      } catch (e) {
+        debug.sigi = `SIGI_STATE JSON parse error: ${e.message}`;
       }
+    } else {
+      debug.sigi = 'no SIGI_STATE tag';
     }
 
-    // 5) Если SIGI_STATE не сработал (нет мачей или неправильная структура),
-    //    пробуем резервный вариант: regex по "userInfo":{"id":"…","uniqueId":"username","stats":{"followerCount":12345,…}}
+    //
+    // 5) СПОСОБ №2: Парсим JSON из <script id="__NEXT_DATA__">…</script>
+    //
+    const nextRegex = /<script\s+id="__NEXT_DATA__"\s+type="application\/json">([^<]+)<\/script>/;
+    const nextMatch = html.match(nextRegex);
+    if (nextMatch && nextMatch[1]) {
+      debug.next = 'found __NEXT_DATA__ tag';
+      try {
+        const nextJson = JSON.parse(nextMatch[1]);
+        // В новой структуре Next.js данные профиля могут лежать по пути:
+        // nextJson.props.pageProps.userInfo.stats.followerCount
+        // Иногда: nextJson.props.pageProps.userPage.userInfo.stats.followerCount
+        let candidate = null;
+        if (
+          nextJson.props &&
+          nextJson.props.pageProps &&
+          nextJson.props.pageProps.userInfo &&
+          nextJson.props.pageProps.userInfo.stats &&
+          typeof nextJson.props.pageProps.userInfo.stats.followerCount === 'number'
+        ) {
+          candidate = nextJson.props.pageProps.userInfo.stats.followerCount;
+        } else if (
+          nextJson.props &&
+          nextJson.props.pageProps &&
+          nextJson.props.pageProps.userPage &&
+          nextJson.props.pageProps.userPage.userInfo &&
+          nextJson.props.pageProps.userPage.userInfo.stats &&
+          typeof nextJson.props.pageProps.userPage.userInfo.stats.followerCount === 'number'
+        ) {
+          candidate = nextJson.props.pageProps.userPage.userInfo.stats.followerCount;
+        }
+
+        if (candidate !== null) {
+          count = candidate;
+          response.status(200).json({ followerCount: count });
+          return;
+        } else {
+          debug.next = 'no followerCount at expected __NEXT_DATA__ paths';
+        }
+      } catch (e) {
+        debug.next = `__NEXT_DATA__ JSON parse error: ${e.message}`;
+      }
+    } else {
+      debug.next = 'no __NEXT_DATA__ tag';
+    }
+
+    //
+    // 6) СПОСОБ №3 (РЕЗЕРВНЫЙ): Ищем через регулярку `"userInfo":{ … "stats":{ … "followerCount":<число>`
+    //
+    debug.regex = 'attempting fallback regex';
+    // Строим шаблон, учитывая, что uniqueId может идти позже, но обязательно содержит имя пользователя
     const userInfoRegex = new RegExp(
       `"userInfo":\\{[^}]*"uniqueId":"${username}"[^}]*"stats":\\{[^}]*"followerCount":(\\d+)`,
       'i'
     );
     const userInfoMatch = html.match(userInfoRegex);
-
     if (userInfoMatch && userInfoMatch[1]) {
       const fallbackCount = parseInt(userInfoMatch[1], 10);
-      response.status(200).json({ followerCount: fallbackCount });
+      count = fallbackCount;
+      response.status(200).json({ followerCount: count });
       return;
+    } else {
+      debug.regex = 'no match on fallback regex';
     }
 
-    // 6) Если ни один метод не нашёл followerCount
+    //
+    // 7) Если ни один способ не сработал, возвращаем подробный ответ об ошибке
+    //
     response.status(404).json({
       error: 'followerCount not found',
-      detail: {
-        sigiAttempt: sigiMatch ? 'found SIGI_STATE tag but path mismatch' : 'no SIGI_STATE tag',
-        userInfoAttempt: userInfoMatch ? 'found userInfo but regex failed' : 'no userInfo match'
-      }
+      detail: debug
     });
-
-  } catch (e) {
-    response.status(500).json({ error: 'internal error', details: e.message });
+  } catch (err) {
+    // 8) В случае любой непредвиденной ошибки
+    response.status(500).json({ error: 'internal error', details: err.message });
   }
 }
