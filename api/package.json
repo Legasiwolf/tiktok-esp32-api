@@ -1,8 +1,0 @@
-{
-  "name": "tiktok-esp32-api",
-  "version": "1.0.0",
-  "scripts": {},
-  "dependencies": {
-    "node-fetch": "^2.6.12"
-  }
-}
