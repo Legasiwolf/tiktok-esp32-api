@@ -14,9 +14,10 @@ export default async function handler(request, response) {
     //------------------------------------
     // ШАГ А: СКАЧИВАЕМ HTML СТРАНИЦЫ ПРОФИЛЯ
     //------------------------------------
+    // Обратите внимание: убрали лишнюю кавычку перед ?lang=en
     const profileUrl = `https://www.tiktok.com/@${username}?lang=en`;
 
-    // Притворяемся браузером, чтобы TikTok не подсовывал “страницу защиты”
+    // Притворяемся браузером, чтобы TikTok не подсовывал «страницу защиты»
     const htmlResp = await fetch(profileUrl, {
       headers: {
         'User-Agent':
@@ -41,22 +42,21 @@ export default async function handler(request, response) {
     const html = await htmlResp.text();
 
     //------------------------------------
-    // ШАГ Б: ИЩЕМ "followerCount":<число> и "heartCount":<число>
+    // ШАГ Б: ИЩЕМ ВСТАВОЧНЫЙ JSON-СКРИПТ "stats":{...}
     //------------------------------------
-    const followerRegex = /"followerCount":\s*([0-9]+)/;
-    const heartRegex    = /"heartCount":\s*([0-9]+)/;
+    // Регулярка: ищем "stats":{ ... "followerCount":12345 ... "heartCount":67890 ... }
+    const statsRegex = /"stats":\s*\{[^}]*?"followerCount":\s*([0-9]+)[^}]*?"heartCount":\s*([0-9]+)[^}]*?\}/;
 
-    const followerMatch = html.match(followerRegex);
-    const heartMatch    = html.match(heartRegex);
+    const statsMatch = html.match(statsRegex);
 
-    if (followerMatch && followerMatch[1] && heartMatch && heartMatch[1]) {
-      const followerCount = parseInt(followerMatch[1], 10);
-      const heartCount    = parseInt(heartMatch[1], 10);
+    if (statsMatch && statsMatch[1] && statsMatch[2]) {
+      const followerCount = parseInt(statsMatch[1], 10);
+      const heartCount    = parseInt(statsMatch[2], 10);
 
       // Возвращаем оба числа
       response.status(200).json({
         followerCount: followerCount,
-        heartCount: heartCount
+        heartCount:    heartCount
       });
       return;
     }
@@ -68,7 +68,7 @@ export default async function handler(request, response) {
       error: 'followerCount or heartCount not found',
       detail: {
         attemptedUrl: profileUrl,
-        note: 'tried regex /"followerCount":([0-9]+)/ and /"heartCount":([0-9]+)/'
+        note: 'tried regex /"stats":\\s*\\{[^}]*"followerCount":([0-9]+)[^}]*"heartCount":([0-9]+)[^}]*\\}/'
       }
     });
   } catch (err) {
