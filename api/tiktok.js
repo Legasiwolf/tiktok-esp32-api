@@ -3,120 +3,81 @@
 import fetch from 'node-fetch';
 
 export default async function handler(request, response) {
+  // 1) Проверяем параметр ?user=...
   const username = request.query.user;
   if (!username) {
     response.status(400).json({ error: 'missing user parameter' });
     return;
   }
 
-  // Для отладки запомним, какие способы мы пытались
-  const debug = {
-    attemptUserDetail: 'not attempted',
-    attemptHtmlScraping: 'not attempted'
-  };
-
   try {
     //------------------------------------
-    // 2) СПОСОБ №1: “user/detail” API
+    // ШАГ А: СКАЧИВАЕМ HTML СТРАНИЦЫ ПРОФИЛЯ
     //------------------------------------
-    const apiUrl = `https://www.tiktok.com/api/user/detail/?uniqueId=${username}`;
-    const apiResp = await fetch(apiUrl, {
+    const profileUrl = `https://www.tiktok.com/@${username}?lang=en`;
+
+    // Притворяемся браузером, чтобы TikTok не подсовывал “страницу защиты”
+    const htmlResp = await fetch(profileUrl, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
           'AppleWebKit/537.36 (KHTML, like Gecko) ' +
           'Chrome/115.0.0.0 Safari/537.36',
-        Accept: 'application/json, text/javascript, */*; q=0.01',
-        'Accept-Language': 'en-US,en;q=0.9',
-        Referer: `https://www.tiktok.com/@${username}`
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9',
+        'Accept-Language': 'en-US,en;q=0.9'
       },
       redirect: 'follow',
       cache: 'no-store'
     });
 
-    debug.attemptUserDetail = `status ${apiResp.status}, content-length ${apiResp.headers.get('content-length')}`;
-
-    if (apiResp.ok) {
-      const text = await apiResp.text();
-      if (text && text.trim().length > 0) {
-        try {
-          const json = JSON.parse(text);
-          if (
-            json.userInfo &&
-            json.userInfo.stats &&
-            typeof json.userInfo.stats.followerCount === 'number'
-          ) {
-            return response.status(200).json({
-              followerCount: json.userInfo.stats.followerCount
-            });
-          } else {
-            debug.attemptUserDetail += ' → no followerCount field';
-          }
-        } catch (e) {
-          debug.attemptUserDetail += ` → parse error: ${e.message}`;
-        }
-      } else {
-        debug.attemptUserDetail += ' → empty body';
-      }
-    } else {
-      debug.attemptUserDetail += ' → HTTP not OK';
-    }
-
-    //------------------------------------
-    // 3) СПОСОБ №2: HTML-скрейп (регулярка)
-    //------------------------------------
-    debug.attemptHtmlScraping = 'started';
-    const htmlResp = await fetch(
-      `https://www.tiktok.com/@${username}?lang=en`,
-      {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-            'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-            'Chrome/115.0.0.0 Safari/537.36',
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9',
-          'Accept-Language': 'en-US,en;q=0.9'
-        },
-        redirect: 'follow',
-        cache: 'no-store'
-      }
-    );
-
     if (!htmlResp.ok) {
-      debug.attemptHtmlScraping += ` → HTTP ${htmlResp.status}`;
-      return response.status(htmlResp.status).json({
-        error: 'failed to fetch HTML for scraping',
-        detail: debug
-      });
+      // Если TikTok вернул ошибку (404, 503 и т. д.)
+      response
+        .status(htmlResp.status)
+        .json({ error: `failed to fetch TikTok page (status ${htmlResp.status})` });
+      return;
     }
 
     const html = await htmlResp.text();
-    debug.attemptHtmlScraping += ' → fetched HTML';
 
-    const simpleRegex = /"followerCount":\s*([0-9]+)/;
-    const simpleMatch = html.match(simpleRegex);
-    if (simpleMatch && simpleMatch[1]) {
-      const fallbackCount = parseInt(simpleMatch[1], 10);
-      return response.status(200).json({ followerCount: fallbackCount });
-    } else {
-      debug.attemptHtmlScraping += ' → regex not found';
+    //------------------------------------
+    // ШАГ Б: ИЩЕМ "followerCount":<число> и "heartCount":<число>
+    //------------------------------------
+    const followerRegex = /"followerCount":\s*([0-9]+)/;
+    const heartRegex    = /"heartCount":\s*([0-9]+)/;
+
+    const followerMatch = html.match(followerRegex);
+    const heartMatch    = html.match(heartRegex);
+
+    if (followerMatch && followerMatch[1] && heartMatch && heartMatch[1]) {
+      const followerCount = parseInt(followerMatch[1], 10);
+      const heartCount    = parseInt(heartMatch[1], 10);
+
+      // Возвращаем оба числа
+      response.status(200).json({
+        followerCount: followerCount,
+        heartCount: heartCount
+      });
+      return;
     }
 
     //------------------------------------
-    // 4) Нечего больше пробовать → 404 + debug
+    // ШАГ В: Если не удалось найти оба поля — возвращаем debug
     //------------------------------------
-    return response.status(404).json({
-      error: 'followerCount not found',
-      detail: debug
+    response.status(404).json({
+      error: 'followerCount or heartCount not found',
+      detail: {
+        attemptedUrl: profileUrl,
+        note: 'tried regex /"followerCount":([0-9]+)/ and /"heartCount":([0-9]+)/'
+      }
     });
   } catch (err) {
     //------------------------------------
-    // 5) Любая внутренняя ошибка
+    // ШАГ Г: Ловим все непредвиденные ошибки
     //------------------------------------
-    return response.status(500).json({
+    response.status(500).json({
       error: 'internal error',
-      details: err.message,
-      debug: debug
+      details: err.message
     });
   }
 }
